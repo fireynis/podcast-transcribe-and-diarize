@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,14 +11,36 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
-const (
-	WhisperURL         = "https://api.openai.com/v1/audio/transcriptions"
-	ChatCompletionsURL = "https://api.openai.com/v1/chat/completions"
-	transcriptionFile  = "transcription.txt"
-	diarizedFile       = "diarized.txt"
-)
+type Config struct {
+	WhisperURL           string
+	ChatCompletionsURL   string
+	TranscriptionFile    string
+	DiarizedFile         string
+	TranscriptionTimeout time.Duration
+	DiarizationTimeout   time.Duration
+	MaxResponseBodySize  int64
+	MaxAudioFileSize     int64
+	HTTPTimeout          time.Duration
+}
+
+var config = Config{
+	WhisperURL:           "https://api.openai.com/v1/audio/transcriptions",
+	ChatCompletionsURL:   "https://api.openai.com/v1/chat/completions",
+	TranscriptionFile:    "transcription.txt",
+	DiarizedFile:         "diarized.txt",
+	TranscriptionTimeout: 5 * time.Minute,
+	DiarizationTimeout:   2 * time.Minute,
+	MaxResponseBodySize:  10 * 1024 * 1024,
+	MaxAudioFileSize:     25 * 1024 * 1024,
+	HTTPTimeout:          30 * time.Second,
+}
+
+var httpClient = &http.Client{
+	Timeout: config.HTTPTimeout,
+}
 
 func main() {
 	// Parse command-line arguments
@@ -40,49 +63,61 @@ func main() {
 	var transcript string
 
 	// Check if transcription.txt exists
-	if _, err := os.Stat(transcriptionFile); err == nil {
+	if _, err := os.Stat(config.TranscriptionFile); err == nil {
 		// File exists, load it
-		data, err := os.ReadFile(transcriptionFile)
+		data, err := os.ReadFile(config.TranscriptionFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", transcriptionFile, err)
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", config.TranscriptionFile, err)
 			os.Exit(1)
 		}
 		transcript = string(data)
-		fmt.Printf("Loaded transcription from %s\n", transcriptionFile)
+		fmt.Printf("Loaded transcription from %s\n", config.TranscriptionFile)
 	} else {
 		// File doesn't exist, perform transcription
-		transcript, err = transcribeAudio(apiKey, *audioPath)
+		ctx, cancel := context.WithTimeout(context.Background(), config.TranscriptionTimeout)
+		defer cancel()
+		transcript, err = transcribeAudio(ctx, apiKey, *audioPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error transcribing audio: %v\n", err)
 			os.Exit(1)
 		}
 
 		// Save the transcription to transcription.txt
-		if err := os.WriteFile(transcriptionFile, []byte(transcript), 0644); err != nil {
+		if err := os.WriteFile(config.TranscriptionFile, []byte(transcript), 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing transcription to file: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Transcription saved to %s\n", transcriptionFile)
+		fmt.Printf("Transcription saved to %s\n", config.TranscriptionFile)
 	}
 
 	// Diarize the transcription using the o1 model
-	diarizedTranscript, err := diarizeTranscript(apiKey, transcript, *numSpeakers)
+	ctx, cancel := context.WithTimeout(context.Background(), config.DiarizationTimeout)
+	defer cancel()
+	diarizedTranscript, err := diarizeTranscript(ctx, apiKey, transcript, *numSpeakers)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error diarizing transcript: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Write the diarized transcript to diarized.txt
-	if err = os.WriteFile(diarizedFile, []byte("=== Diarized Transcript ===\n"+diarizedTranscript+"\n"), 0644); err != nil {
+	if err = os.WriteFile(config.DiarizedFile, []byte("=== Diarized Transcript ===\n"+diarizedTranscript+"\n"), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing diarized transcript to file: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Diarized transcript saved to %s\n", diarizedFile)
+	fmt.Printf("Diarized transcript saved to %s\n", config.DiarizedFile)
 }
 
 // transcribeAudio uploads the audio file to OpenAI's Whisper API and returns the transcription text.
-func transcribeAudio(apiKey, audioPath string) (string, error) {
+func transcribeAudio(ctx context.Context, apiKey, audioPath string) (string, error) {
+	fileInfo, err := os.Stat(audioPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get file info: %v", err)
+	}
+	if fileInfo.Size() > config.MaxAudioFileSize {
+		return "", fmt.Errorf("audio file too large: %d bytes (max: %d bytes)", fileInfo.Size(), config.MaxAudioFileSize)
+	}
+
 	file, err := os.Open(audioPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open audio file: %v", err)
@@ -112,15 +147,14 @@ func transcribeAudio(apiKey, audioPath string) (string, error) {
 		return "", fmt.Errorf("failed to close writer: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", WhisperURL, &requestBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", config.WhisperURL, &requestBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Add("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send request: %v", err)
 	}
@@ -131,7 +165,7 @@ func transcribeAudio(apiKey, audioPath string) (string, error) {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
 		return "", fmt.Errorf("non-200 response: %d, body: %s", resp.StatusCode, string(body))
 	}
 
@@ -146,7 +180,7 @@ func transcribeAudio(apiKey, audioPath string) (string, error) {
 
 // diarizeTranscript sends the transcription to a ChatCompletion endpoint using the o1 model.
 // It does not set a maximum token limit in the request.
-func diarizeTranscript(apiKey, transcript string, numSpeakers int) (string, error) {
+func diarizeTranscript(ctx context.Context, apiKey, transcript string, numSpeakers int) (string, error) {
 	prompt := fmt.Sprintf(`You are an expert in speaker diarization.
 Given the following transcript of a podcast and knowing there are %d speakers, please insert clear breaks and label each segment with the appropriate speaker (e.g., "Speaker 1:", "Speaker 2:", etc.).
 
@@ -167,15 +201,14 @@ Return the diarized transcript.`, numSpeakers, transcript)
 		return "", fmt.Errorf("failed to marshal payload: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", ChatCompletionsURL, bytes.NewBuffer(payloadBytes))
+	req, err := http.NewRequestWithContext(ctx, "POST", config.ChatCompletionsURL, bytes.NewBuffer(payloadBytes))
 	if err != nil {
 		return "", fmt.Errorf("failed to create chat completion request: %v", err)
 	}
 	req.Header.Add("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send chat completion request: %v", err)
 	}
@@ -186,7 +219,7 @@ Return the diarized transcript.`, numSpeakers, transcript)
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, config.MaxResponseBodySize))
 		return "", fmt.Errorf("non-200 response from chat completion: %d, body: %s", resp.StatusCode, string(body))
 	}
 
