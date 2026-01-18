@@ -1,4 +1,5 @@
-transcription.txt
+.DS_Store
+podcast-transcription
+.idea/
 diarized.txt
-.idea
-vendor
+transcription.txt
