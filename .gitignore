@@ -1,4 +1,11 @@
-transcription.txt
+.DS_Store
+podcast-transcription
+.idea/
+vendor/
 diarized.txt
-.idea
-vendor
+transcription.txt
+*_transcription.json
+*_diarized.txt
+*_diarized.hash
+*_merged.txt
+*_merged.hash
