@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,9 @@ const (
 	chunkDurationSec = 600 // 10 minutes per chunk
 	chunkOverlapSec  = 30  // 30 seconds overlap for continuity
 )
+
+// Global semaphore to limit concurrent Whisper API requests across all tracks/chunks
+var whisperSemaphore = make(chan struct{}, 1)
 
 // checkFFmpeg verifies that ffmpeg is available
 func checkFFmpeg() error {
@@ -114,6 +119,7 @@ func splitAudioFile(audioPath string, tempDir string) ([]string, error) {
 			"-acodec", "libmp3lame",
 			"-ar", "16000", // Whisper prefers 16kHz
 			"-ac", "1", // Mono
+			"-b:a", "32k", // Low bitrate — Whisper only needs speech quality
 			"-y", // Overwrite
 			chunkPath)
 
@@ -135,6 +141,36 @@ type chunkResult struct {
 	transcription *Transcription
 	startOffset   float64
 	err           error
+}
+
+// trackFlag implements flag.Value for repeated -track flags
+type trackFlag []string
+
+func (t *trackFlag) String() string {
+	return strings.Join(*t, ", ")
+}
+
+func (t *trackFlag) Set(value string) error {
+	*t = append(*t, value)
+	return nil
+}
+
+// TrackInput represents a parsed track: speaker name + audio file path
+type TrackInput struct {
+	Speaker   string
+	AudioPath string
+}
+
+// SpeakerSegment is a transcribed segment tagged with a speaker name
+type SpeakerSegment struct {
+	Speaker string
+	Segment Segment
+}
+
+// TrackTranscription pairs a speaker name with their transcription result
+type TrackTranscription struct {
+	Speaker       string         `json:"speaker"`
+	Transcription *Transcription `json:"transcription"`
 }
 
 // transcribeChunks transcribes multiple audio chunks in parallel and stitches the results
@@ -295,6 +331,15 @@ func transcribeSingleFile(ctx context.Context, apiKey, audioPath, language strin
 	}
 
 	bodyBytes := requestBody.Bytes()
+
+	// Acquire global semaphore to limit concurrent Whisper API requests
+	select {
+	case whisperSemaphore <- struct{}{}:
+		defer func() { <-whisperSemaphore }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", config.WhisperURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
@@ -305,7 +350,7 @@ func transcribeSingleFile(ctx context.Context, apiKey, audioPath, language strin
 	req.Header.Add("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	resp, err := doRequestWithRetry(ctx, req, 3)
+	resp, err := doRequestWithRetry(ctx, req, 6)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %v", err)
 	}
@@ -371,8 +416,13 @@ func isRetryableError(err error, statusCode int) bool {
 		// Network errors are generally retryable
 		return true
 	}
-	// Retry on 5xx server errors and 429 rate limit
+	// Retry on 5xx server errors and 429 rate limit (quota errors are handled separately)
 	return statusCode >= 500 || statusCode == 429
+}
+
+// isQuotaError checks if a 429 response is actually an unrecoverable quota exhaustion
+func isQuotaError(body []byte) bool {
+	return bytes.Contains(body, []byte("insufficient_quota"))
 }
 
 // doRequestWithRetry executes an HTTP request with exponential backoff retry logic
@@ -381,17 +431,25 @@ func isRetryableError(err error, statusCode int) bool {
 func doRequestWithRetry(ctx context.Context, req *http.Request, maxRetries int) (*http.Response, error) {
 	var lastErr error
 	var resp *http.Response
+	retryAfter := time.Duration(0)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff: 1s, 2s, 4s
-			backoff := time.Duration(1<<(attempt-1)) * time.Second
+			var backoff time.Duration
+			if retryAfter > 0 {
+				// Use server-specified Retry-After with a small buffer
+				backoff = retryAfter + 2*time.Second
+				retryAfter = 0
+			} else {
+				// Exponential backoff: 2s, 4s, 8s, 16s, ...
+				backoff = time.Duration(2*(1<<(attempt-1))) * time.Second
+			}
+			fmt.Fprintf(os.Stderr, "Retrying request (attempt %d/%d, waiting %s)...\n", attempt+1, maxRetries+1, backoff)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
-			fmt.Fprintf(os.Stderr, "Retrying request (attempt %d/%d)...\n", attempt+1, maxRetries+1)
 		}
 
 		// Clone request for retry (body needs to be re-readable)
@@ -416,6 +474,25 @@ func doRequestWithRetry(ctx context.Context, req *http.Request, maxRetries int) 
 			return resp, nil
 		}
 
+		// Parse Retry-After header if present (429 responses)
+		if resp.StatusCode == 429 {
+			// Read body to check for quota exhaustion vs rate limit
+			if resp.Body != nil {
+				bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+				resp.Body.Close()
+				if isQuotaError(bodyBytes) {
+					return nil, fmt.Errorf("OpenAI quota exceeded — add credits at https://platform.openai.com/account/billing")
+				}
+				fmt.Fprintf(os.Stderr, "  Rate limited (429): %s\n", string(bodyBytes))
+			}
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, err := strconv.Atoi(ra); err == nil {
+					retryAfter = time.Duration(secs) * time.Second
+				}
+			}
+			continue
+		}
+
 		// Read and discard body before retry
 		if resp.Body != nil {
 			io.Copy(io.Discard, resp.Body)
@@ -435,21 +512,31 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Podcast Transcription & Diarization Tool
 
-Transcribes audio files using OpenAI Whisper and performs speaker diarization
-using GPT-4 to separate different speakers in the transcript.
+Transcribes audio files using OpenAI Whisper and performs speaker diarization.
+
+Modes:
+  Single-file mode:  Uses GPT-4 to identify speakers in a mixed audio file.
+  Multi-track mode:  Transcribes separate per-speaker audio files and merges
+                     them chronologically. Skips GPT-4 diarization entirely.
 
 Usage:
   podcast-transcription -audio <file> [options]
+  podcast-transcription -track "Speaker=file" -track "Speaker=file" [options]
 
 Examples:
+  # Single-file mode
   podcast-transcription -audio podcast.mp3
   podcast-transcription -audio interview.mp3 -speakers 3 -names "Host,Guest1,Guest2"
-  podcast-transcription -audio spanish.mp3 -language es -output-dir ./output
+
+  # Multi-track mode
+  podcast-transcription -track "Jeremy=jeremy.mp3" -track "Bob=bob.mp3"
+  podcast-transcription -track "Host=host.wav" -track "Guest=guest.wav" -output episode-42
 
 Options:
 `)
-		fmt.Fprintf(os.Stderr, "\nInput:\n")
-		fmt.Fprintf(os.Stderr, "  -audio string\n\tPath to audio file (required)\n")
+		fmt.Fprintf(os.Stderr, "\nInput (mutually exclusive):\n")
+		fmt.Fprintf(os.Stderr, "  -audio string\n\tPath to audio file (single-file mode)\n")
+		fmt.Fprintf(os.Stderr, "  -track string\n\tSpeaker=file pair, repeatable (multi-track mode)\n")
 
 		fmt.Fprintf(os.Stderr, "\nOutput:\n")
 		fmt.Fprintf(os.Stderr, "  -output-dir string\n\tOutput directory (default: current directory)\n")
@@ -459,7 +546,7 @@ Options:
 		fmt.Fprintf(os.Stderr, "  -language string\n\tLanguage code (e.g., 'en', 'es', 'fr'). Empty for auto-detect\n")
 		fmt.Fprintf(os.Stderr, "  -no-chunk\n\tDisable automatic chunking of large files (requires ffmpeg)\n")
 
-		fmt.Fprintf(os.Stderr, "\nDiarization:\n")
+		fmt.Fprintf(os.Stderr, "\nDiarization (single-file mode only):\n")
 		fmt.Fprintf(os.Stderr, "  -speakers int\n\tNumber of speakers (default: 2)\n")
 		fmt.Fprintf(os.Stderr, "  -names string\n\tComma-separated speaker names (e.g., 'Alice,Bob')\n")
 		fmt.Fprintf(os.Stderr, "  -force-diarize\n\tForce re-diarization even if cached\n")
@@ -468,14 +555,21 @@ Options:
 		fmt.Fprintf(os.Stderr, "  OPENAI_API_KEY\n\tRequired. Your OpenAI API key\n")
 
 		fmt.Fprintf(os.Stderr, "\nOutput Files:\n")
-		fmt.Fprintf(os.Stderr, "  {name}_transcription.json  Full transcription with timestamps\n")
-		fmt.Fprintf(os.Stderr, "  {name}_diarized.txt        Speaker-labeled transcript\n")
-		fmt.Fprintf(os.Stderr, "  {name}_diarized.hash       Cache hash (auto-generated)\n")
+		fmt.Fprintf(os.Stderr, "  Single-file mode:\n")
+		fmt.Fprintf(os.Stderr, "    {name}_transcription.json  Full transcription with timestamps\n")
+		fmt.Fprintf(os.Stderr, "    {name}_diarized.txt        Speaker-labeled transcript\n")
+		fmt.Fprintf(os.Stderr, "    {name}_diarized.hash       Cache hash (auto-generated)\n")
+		fmt.Fprintf(os.Stderr, "  Multi-track mode:\n")
+		fmt.Fprintf(os.Stderr, "    {speaker}_transcription.json  Per-speaker transcription (cached)\n")
+		fmt.Fprintf(os.Stderr, "    {name}_merged.txt             Chronologically merged transcript\n")
+		fmt.Fprintf(os.Stderr, "    {name}_merged.hash            Cache hash (auto-generated)\n")
 
 		fmt.Fprintf(os.Stderr, "\nFor more information, see: https://github.com/your-repo/podcast-transcription\n")
 	}
 
 	// Parse command-line arguments
+	var tracks trackFlag
+	flag.Var(&tracks, "track", "Speaker=file pair for multi-track mode (repeatable)")
 	audioPath := flag.String("audio", "", "Path to the audio file")
 	numSpeakers := flag.Int("speakers", 2, "Number of speakers in the podcast")
 	outputDir := flag.String("output-dir", ".", "Output directory for generated files")
@@ -486,8 +580,17 @@ Options:
 	forceDiarize := flag.Bool("force-diarize", false, "Force re-diarization even if cached")
 	flag.Parse()
 
-	if *audioPath == "" {
-		fmt.Fprintln(os.Stderr, "Please provide the path to the audio file using -audio")
+	hasTracks := len(tracks) > 0
+	hasAudio := *audioPath != ""
+
+	// Mutual exclusivity check
+	if hasTracks && hasAudio {
+		fmt.Fprintln(os.Stderr, "Error: -audio and -track are mutually exclusive. Use one or the other.")
+		os.Exit(1)
+	}
+	if !hasTracks && !hasAudio {
+		fmt.Fprintln(os.Stderr, "Error: provide either -audio <file> or -track \"Speaker=file\" (at least 2)")
+		flag.Usage()
 		os.Exit(1)
 	}
 
@@ -497,6 +600,19 @@ Options:
 		fmt.Fprintln(os.Stderr, "Please set the OPENAI_API_KEY environment variable")
 		os.Exit(1)
 	}
+
+	// Multi-track mode
+	if hasTracks {
+		parsedTracks, err := parseTracks(tracks)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		runMultiTrackMode(apiKey, parsedTracks, *outputDir, *outputBase, *language, *noChunk)
+		return
+	}
+
+	// --- Single-file mode (existing behavior, unchanged below) ---
 
 	// Check ffmpeg availability if chunking might be needed
 	if !*noChunk {
@@ -691,7 +807,7 @@ Return the diarized transcript.`, numSpeakers, transcript)
 	req.Header.Add("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := doRequestWithRetry(ctx, req, 3)
+	resp, err := doRequestWithRetry(ctx, req, 6)
 	if err != nil {
 		return "", fmt.Errorf("failed to send chat completion request: %v", err)
 	}
@@ -721,4 +837,348 @@ Return the diarized transcript.`, numSpeakers, transcript)
 		return "", fmt.Errorf("no choices returned from chat completion")
 	}
 	return res.Choices[0].Message.Content, nil
+}
+
+// parseTracks parses and validates raw -track flag values ("Speaker=file.mp3")
+func parseTracks(raw []string) ([]TrackInput, error) {
+	if len(raw) < 2 {
+		return nil, fmt.Errorf("at least 2 tracks are required, got %d", len(raw))
+	}
+
+	seen := make(map[string]bool)
+	tracks := make([]TrackInput, 0, len(raw))
+
+	for _, r := range raw {
+		parts := strings.SplitN(r, "=", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf("invalid track format %q: expected \"Speaker=file.mp3\"", r)
+		}
+		speaker := parts[0]
+		audioPath := parts[1]
+
+		lowerSpeaker := strings.ToLower(speaker)
+		if seen[lowerSpeaker] {
+			return nil, fmt.Errorf("duplicate speaker name %q", speaker)
+		}
+		seen[lowerSpeaker] = true
+
+		if _, err := os.Stat(audioPath); err != nil {
+			return nil, fmt.Errorf("audio file for speaker %q not found: %v", speaker, err)
+		}
+
+		tracks = append(tracks, TrackInput{Speaker: speaker, AudioPath: audioPath})
+	}
+
+	return tracks, nil
+}
+
+// sanitizeSpeakerName returns a filesystem-safe version of a speaker name
+var unsafeCharsRe = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+func sanitizeSpeakerName(name string) string {
+	safe := unsafeCharsRe.ReplaceAllString(name, "_")
+	return strings.ToLower(safe)
+}
+
+// getTrackTranscriptionPath returns the cache path for a per-track transcription JSON
+func getTrackTranscriptionPath(outputDir, speaker string) string {
+	return filepath.Join(outputDir, sanitizeSpeakerName(speaker)+"_transcription.json")
+}
+
+// getMultiTrackOutputPaths returns the merged output and hash file paths
+func getMultiTrackOutputPaths(outputDir, outputBase string) (mergedPath, hashPath string) {
+	base := outputBase
+	if base == "" {
+		base = "podcast"
+	}
+	mergedPath = filepath.Join(outputDir, base+"_merged.txt")
+	hashPath = filepath.Join(outputDir, base+"_merged.hash")
+	return
+}
+
+// computeMultiTrackHash returns a SHA256 hash of all speaker names and texts combined
+func computeMultiTrackHash(trackTranscriptions []TrackTranscription) string {
+	h := sha256.New()
+	for _, tt := range trackTranscriptions {
+		h.Write([]byte(tt.Speaker))
+		h.Write([]byte(tt.Transcription.Text))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// transcribeTracksParallel transcribes all tracks concurrently (semaphore=3), reusing cached results
+func transcribeTracksParallel(ctx context.Context, apiKey string, tracks []TrackInput, outputDir, language string, noChunk bool) ([]TrackTranscription, error) {
+	type trackResult struct {
+		index int
+		tt    TrackTranscription
+		err   error
+	}
+
+	results := make(chan trackResult, len(tracks))
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 3)
+
+	for i, track := range tracks {
+		wg.Add(1)
+		go func(index int, t TrackInput) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			cachePath := getTrackTranscriptionPath(outputDir, t.Speaker)
+
+			// Try to load from cache
+			if data, err := os.ReadFile(cachePath); err == nil {
+				var cached Transcription
+				if err := json.Unmarshal(data, &cached); err == nil {
+					fmt.Printf("Loaded cached transcription for %s from %s\n", t.Speaker, cachePath)
+					results <- trackResult{index: index, tt: TrackTranscription{Speaker: t.Speaker, Transcription: &cached}}
+					return
+				}
+			}
+
+			// Transcribe
+			fmt.Printf("Transcribing track for %s (%s)...\n", t.Speaker, t.AudioPath)
+			trans, err := transcribeAudio(ctx, apiKey, t.AudioPath, language, noChunk)
+			if err != nil {
+				results <- trackResult{index: index, err: fmt.Errorf("failed to transcribe track for %s: %w", t.Speaker, err)}
+				return
+			}
+
+			// Cache the result
+			data, err := json.MarshalIndent(trans, "", "  ")
+			if err == nil {
+				if writeErr := os.WriteFile(cachePath, data, 0644); writeErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to cache transcription for %s: %v\n", t.Speaker, writeErr)
+				} else {
+					fmt.Printf("Cached transcription for %s to %s\n", t.Speaker, cachePath)
+				}
+			}
+
+			results <- trackResult{index: index, tt: TrackTranscription{Speaker: t.Speaker, Transcription: trans}}
+		}(i, track)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	collected := make([]trackResult, 0, len(tracks))
+	for r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		collected = append(collected, r)
+	}
+
+	sort.Slice(collected, func(i, j int) bool {
+		return collected[i].index < collected[j].index
+	})
+
+	out := make([]TrackTranscription, len(collected))
+	for i, c := range collected {
+		out[i] = c.tt
+	}
+	return out, nil
+}
+
+// wordSet returns a set of lowercased, punctuation-stripped words from a string
+func wordSet(s string) map[string]struct{} {
+	words := strings.Fields(strings.ToLower(s))
+	set := make(map[string]struct{}, len(words))
+	for _, w := range words {
+		w = strings.Trim(w, ".,;:!?\"'()-")
+		if w != "" {
+			set[w] = struct{}{}
+		}
+	}
+	return set
+}
+
+// containmentSimilarity returns what fraction of the smaller set is contained in the larger one.
+// This handles cases where one segment is a fragment of a longer one (common with mic bleed
+// where Whisper splits the bleed into small chunks).
+func containmentSimilarity(a, b map[string]struct{}) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	// Count words from the smaller set that appear in the larger set
+	small, large := a, b
+	if len(b) < len(a) {
+		small, large = b, a
+	}
+	intersection := 0
+	for w := range small {
+		if _, ok := large[w]; ok {
+			intersection++
+		}
+	}
+	return float64(intersection) / float64(len(small))
+}
+
+// deduplicateBleeded removes segments caused by mic bleed.
+// When two segments from different speakers overlap in time and share most of
+// their words, the later-starting one is dropped (it's bleed from the other mic).
+func deduplicateBleeded(sorted []SpeakerSegment) []SpeakerSegment {
+	if len(sorted) == 0 {
+		return nil
+	}
+
+	const (
+		containmentThreshold = 0.6  // 60% of smaller segment's words found in larger = bleed
+		timeWindowSec        = 20.0 // only compare segments starting within 20s of each other
+	)
+
+	kept := make([]bool, len(sorted))
+	for i := range kept {
+		kept[i] = true
+	}
+
+	for i := 0; i < len(sorted); i++ {
+		if !kept[i] {
+			continue
+		}
+		wordsI := wordSet(sorted[i].Segment.Text)
+
+		for j := i + 1; j < len(sorted); j++ {
+			if !kept[j] {
+				continue
+			}
+			// Stop looking once segment starts are too far apart
+			if sorted[j].Segment.Start-sorted[i].Segment.Start > timeWindowSec {
+				break
+			}
+			// Only deduplicate across different speakers
+			if sorted[j].Speaker == sorted[i].Speaker {
+				continue
+			}
+
+			wordsJ := wordSet(sorted[j].Segment.Text)
+			sim := containmentSimilarity(wordsI, wordsJ)
+			if sim >= containmentThreshold {
+				// Drop the later segment (it's bleed from the other mic)
+				kept[j] = false
+			}
+		}
+	}
+
+	var result []SpeakerSegment
+	dropped := 0
+	for i, seg := range sorted {
+		if kept[i] {
+			result = append(result, seg)
+		} else {
+			dropped++
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Dedup: %d segments in, %d dropped, %d kept\n", len(sorted), dropped, len(result))
+	return result
+}
+
+// mergeTrackSegments pools all segments from all tracks, deduplicates mic bleed,
+// sorts by timestamp, and merges consecutive same-speaker segments
+func mergeTrackSegments(trackTranscriptions []TrackTranscription) []SpeakerSegment {
+	// Pool all segments
+	var all []SpeakerSegment
+	for _, tt := range trackTranscriptions {
+		for _, seg := range tt.Transcription.Segments {
+			all = append(all, SpeakerSegment{Speaker: tt.Speaker, Segment: seg})
+		}
+	}
+
+	// Sort by Start ascending, tiebreak by End ascending
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Segment.Start == all[j].Segment.Start {
+			return all[i].Segment.End < all[j].Segment.End
+		}
+		return all[i].Segment.Start < all[j].Segment.Start
+	})
+
+	// Remove mic bleed duplicates
+	all = deduplicateBleeded(all)
+
+	// Merge consecutive same-speaker segments
+	if len(all) == 0 {
+		return nil
+	}
+
+	merged := []SpeakerSegment{all[0]}
+	for i := 1; i < len(all); i++ {
+		last := &merged[len(merged)-1]
+		cur := all[i]
+		if cur.Speaker == last.Speaker {
+			last.Segment.Text += " " + strings.TrimSpace(cur.Segment.Text)
+			if cur.Segment.End > last.Segment.End {
+				last.Segment.End = cur.Segment.End
+			}
+		} else {
+			merged = append(merged, cur)
+		}
+	}
+
+	return merged
+}
+
+// formatMergedTranscript formats speaker segments as "[MM:SS] Speaker: text"
+func formatMergedTranscript(segments []SpeakerSegment) string {
+	var b strings.Builder
+	b.WriteString("=== Multi-Track Merged Transcript ===\n\n")
+	for _, seg := range segments {
+		mins := int(seg.Segment.Start) / 60
+		secs := int(seg.Segment.Start) % 60
+		fmt.Fprintf(&b, "[%02d:%02d] %s: %s\n\n", mins, secs, seg.Speaker, strings.TrimSpace(seg.Segment.Text))
+	}
+	return b.String()
+}
+
+// runMultiTrackMode is the top-level orchestrator for multi-track transcription and merging
+func runMultiTrackMode(apiKey string, tracks []TrackInput, outputDir, outputBase, language string, noChunk bool) {
+	// Check ffmpeg availability if chunking might be needed
+	if !noChunk {
+		if err := checkFFmpeg(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: %v\nChunking will be disabled.\n", err)
+			noChunk = true
+		}
+	}
+
+	// Ensure output directory exists
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating output directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Transcribe all tracks (with caching)
+	ctx, cancel := context.WithTimeout(context.Background(), config.TranscriptionTimeout)
+	defer cancel()
+
+	trackTranscriptions, err := transcribeTracksParallel(ctx, apiKey, tracks, outputDir, language, noChunk)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error transcribing tracks: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Check merge cache
+	mergedPath, hashPath := getMultiTrackOutputPaths(outputDir, outputBase)
+	currentHash := computeMultiTrackHash(trackTranscriptions)
+	if isDiarizationCached(mergedPath, hashPath, currentHash) {
+		fmt.Printf("Merged transcript cached (transcriptions unchanged), skipping.\n")
+		fmt.Printf("Merged transcript at %s\n", mergedPath)
+		return
+	}
+
+	// Merge and format
+	merged := mergeTrackSegments(trackTranscriptions)
+	output := formatMergedTranscript(merged)
+
+	if err := os.WriteFile(mergedPath, []byte(output), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing merged transcript: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(hashPath, []byte(currentHash), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to write hash file: %v\n", err)
+	}
+
+	fmt.Printf("Merged transcript saved to %s\n", mergedPath)
 }

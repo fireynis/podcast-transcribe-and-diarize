@@ -3,3 +3,8 @@ podcast-transcription
 .idea/
 diarized.txt
 transcription.txt
+*_transcription.json
+*_diarized.txt
+*_diarized.hash
+*_merged.txt
+*_merged.hash
