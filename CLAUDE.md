@@ -69,7 +69,6 @@ go mod tidy
 - `transcription.txt` - Cached transcription output (auto-generated)
 - `diarized.txt` - Final diarized transcript output (auto-generated)
 - `go.mod` - Module definition and dependencies
-- `vendor/` - Vendored dependencies
 
 ## Command Line Interface
 
